@@ -3,11 +3,13 @@
 The JAX parameter trees produced here keep the exact HuggingFace dotted
 parameter names (nested), so weights convert without renaming.
 """
+
+
+from __future__ import annotations
+
 from .architecture import Architecture, detect_architecture
 from .provenance import CheckpointProvenance, resolve_checkpoint_provenance 
 from .substrate import FrozenJAXSubstrate
-
-from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from typing import Any
