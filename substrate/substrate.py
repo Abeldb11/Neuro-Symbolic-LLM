@@ -13,13 +13,9 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-
 import jax
 import jax.numpy as jnp
 from flax.core import freeze, unfreeze
-
-from .models import run_embeddings, run_lm_head, run_transformer_blocks
-from .provenance import CheckpointProvenance  
 
 from .architecture import (
     Architecture,
@@ -33,6 +29,7 @@ from .memory import (
     maybe_reduce_batch_size,
 )
 from .models import run_embeddings, run_lm_head, run_transformer_blocks
+from .provenance import CheckpointProvenance
 
 
 @dataclass(frozen=True)
@@ -83,8 +80,16 @@ class FrozenJAXSubstrate:
             callable overriding the default identity interception. Must be
             JIT-trace-safe (pure array math only).
         min_memory_headroom: headroom ratio below which a warning is emitted.
+        provenance: optional :class:`~substrate.provenance.CheckpointProvenance`
+            recording which HuggingFace checkpoint (model id + resolved
+            commit SHA) these params came from. ``load_substrate_from_hf``
+            fills this in automatically; callers building a substrate
+            directly from a state dict should supply it themselves if the
+            checkpoint's identity needs to stay verifiable. ``None`` means
+            "provenance was never recorded" -- deliberately distinct from a
+            resolved-but-unresolvable :class:`CheckpointProvenance`, which
+            at least records that resolution was attempted.
     """
-
 
     def __init__(
         self,
@@ -93,7 +98,7 @@ class FrozenJAXSubstrate:
         intercept_layers: Sequence[int] | None = None,
         modify_hook: Callable[[jax.Array, int], jax.Array] | None = None,
         min_memory_headroom: float = 0.5,
-        provenance: CheckpointProvenance | None = None,   # ADD THIS PARAM
+        provenance: CheckpointProvenance | None = None,
     ) -> None:
         if not isinstance(params, Mapping):
             raise TypeError("params must be a mapping (nested param PyTree)")
@@ -105,6 +110,12 @@ class FrozenJAXSubstrate:
         self._min_memory_headroom = float(min_memory_headroom)
         self._modify_hook = modify_hook
         self._provenance = provenance
+        # Params are stored as an immutable Flax FrozenDict. JAX arrays are
+        # immutable, so this reference snapshot also captures the values; no
+        # 2x copy is kept (memory-conscious).
+        self._params = freeze(params)
+        self._pristine = freeze(params)
+        self._call_count = 0
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -117,16 +128,13 @@ class FrozenJAXSubstrate:
         return self._intercept_layers
 
     @property
-    def intercept_layers(self) -> tuple[int, ...]:
-        return self._intercept_layers
-
-    @property
     def provenance(self) -> CheckpointProvenance | None:
         """Checkpoint identity this substrate was built from, if recorded.
 
         None means provenance was never supplied at construction -- this is
-        distinct from a CheckpointProvenance with resolved=False, which at
-        least confirms resolution was attempted and records why it failed.
+        distinct from a :class:`CheckpointProvenance` with ``resolved=False``,
+        which at least confirms resolution was attempted and records why it
+        failed.
         """
         return self._provenance
 

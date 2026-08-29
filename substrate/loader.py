@@ -4,12 +4,7 @@ The JAX parameter trees produced here keep the exact HuggingFace dotted
 parameter names (nested), so weights convert without renaming.
 """
 
-
 from __future__ import annotations
-
-from .architecture import Architecture, detect_architecture
-from .provenance import CheckpointProvenance, resolve_checkpoint_provenance 
-from .substrate import FrozenJAXSubstrate
 
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -18,17 +13,14 @@ import jax
 import jax.numpy as jnp
 
 from .architecture import Architecture, detect_architecture
+from .provenance import CheckpointProvenance, resolve_checkpoint_provenance
 from .substrate import FrozenJAXSubstrate
 
 _SUPPORTED_FAMILIES = {"gpt2", "gpt_neox"}
 
 
 def _nested_from_dotted(mapping: Mapping[str, Any]) -> Any:
-    """Convert ``{"a.b.c": value}`` into ``{"a": {"b": {"c": value}}}``.
 
-    ``layers.{i}`` segments become list entries so the layer count can be
-    discovered from the sequence length.
-    """
 
     def _insert(root: dict[str, Any], parts: list[str], value: Any) -> None:
         node = root
@@ -58,13 +50,7 @@ def _nested_from_dotted(mapping: Mapping[str, Any]) -> Any:
 
 
 def state_dict_to_jax_pytree(state_dict: Mapping[str, Any]) -> Any:
-    """Convert a torch/HF state dict (or plain numpy mapping) into a JAX
-    parameter PyTree matching the Flax model conventions.
 
-    All leaves are cast to float32: some checkpoints (e.g. Pythia) ship
-    float16 weights, and computing LayerNorm statistics or attention in
-    half precision diverges from the reference fp32 forward pass.
-    """
 
     def _to_jax(value: Any) -> jax.Array:
         if isinstance(value, jax.Array):
@@ -94,14 +80,10 @@ def load_substrate_from_hf(
     intercept_layers: list[int] | None = None,
     modify_hook: Callable[[jax.Array, int], jax.Array] | None = None,
 ) -> FrozenJAXSubstrate:
-
-    from transformers import AutoConfig, AutoModelForCausalLM  
+   
+    from transformers import AutoConfig, AutoModelForCausalLM  # local import
 
     provenance = resolve_checkpoint_provenance(model_id, revision)
-    # Fall back to the raw requested revision (e.g. "main") when resolution
-    # failed, so loading can still proceed offline/cache-only -- the
-    # substrate's `.provenance` honestly records that the pin is unverified,
-    # it does not pretend a resolution happened.
     pinned_revision = provenance.resolved_sha or provenance.requested_revision
 
     config = AutoConfig.from_pretrained(model_id, revision=pinned_revision)
@@ -125,6 +107,7 @@ def load_substrate_from_hf(
         provenance=provenance,
     )
 
+
 def build_substrate_from_state_dict(
     state_dict: Mapping[str, Any],
     config: Any = None,
@@ -132,7 +115,14 @@ def build_substrate_from_state_dict(
     modify_hook: Callable[[jax.Array, int], jax.Array] | None = None,
     provenance: CheckpointProvenance | None = None,
 ) -> FrozenJAXSubstrate:
+    """Build a substrate directly from a state dict (HF naming) and an
+    optional HF config object.
 
+    This entry point never talks to the Hub, so it cannot resolve
+    provenance itself -- pass an already-resolved ``CheckpointProvenance``
+    (e.g. one you resolved earlier, or attached when snapshotting a state
+    dict to disk) if this checkpoint's identity needs to stay verifiable.
+    """
     params = state_dict_to_jax_pytree(state_dict)
     return FrozenJAXSubstrate(
         params=params,
@@ -141,6 +131,7 @@ def build_substrate_from_state_dict(
         modify_hook=modify_hook,
         provenance=provenance,
     )
+
 
 def architecture_from_params(params: Any, config: Any = None) -> Architecture:
     """Convenience alias for architecture detection."""
