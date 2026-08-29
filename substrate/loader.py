@@ -3,6 +3,9 @@
 The JAX parameter trees produced here keep the exact HuggingFace dotted
 parameter names (nested), so weights convert without renaming.
 """
+from .architecture import Architecture, detect_architecture
+from .provenance import CheckpointProvenance, resolve_checkpoint_provenance 
+from .substrate import FrozenJAXSubstrate
 
 from __future__ import annotations
 
@@ -85,25 +88,30 @@ def _hf_model_class(model_family: str):
 
 def load_substrate_from_hf(
     model_id: str,
+    revision: str | None = None,
     intercept_layers: list[int] | None = None,
     modify_hook: Callable[[jax.Array, int], jax.Array] | None = None,
 ) -> FrozenJAXSubstrate:
-    """Download/load a HuggingFace GPT-2 or Pythia/GPT-NeoX checkpoint and
-    wrap it in a ``FrozenJAXSubstrate``.
 
-    The HuggingFace config is only used for hyperparameters; the layer count
-    and hidden size are auto-detected from the parameter tree.
-    """
-    from transformers import AutoConfig, AutoModelForCausalLM  # local import
+    from transformers import AutoConfig, AutoModelForCausalLM  
 
-    config = AutoConfig.from_pretrained(model_id)
+    provenance = resolve_checkpoint_provenance(model_id, revision)
+    # Fall back to the raw requested revision (e.g. "main") when resolution
+    # failed, so loading can still proceed offline/cache-only -- the
+    # substrate's `.provenance` honestly records that the pin is unverified,
+    # it does not pretend a resolution happened.
+    pinned_revision = provenance.resolved_sha or provenance.requested_revision
+
+    config = AutoConfig.from_pretrained(model_id, revision=pinned_revision)
     if config.model_type not in _SUPPORTED_FAMILIES:
         raise ValueError(
             f"Unsupported model architecture {config.model_type!r} for model "
             f"{model_id!r}. Supported: {sorted(_SUPPORTED_FAMILIES)}."
         )
 
-    torch_model = AutoModelForCausalLM.from_pretrained(model_id)
+    torch_model = AutoModelForCausalLM.from_pretrained(
+        model_id, revision=pinned_revision
+    )
     torch_model.eval()
     state_dict = torch_model.state_dict()
     params = state_dict_to_jax_pytree(state_dict)
@@ -112,25 +120,25 @@ def load_substrate_from_hf(
         config=config,
         intercept_layers=intercept_layers,
         modify_hook=modify_hook,
+        provenance=provenance,
     )
-
 
 def build_substrate_from_state_dict(
     state_dict: Mapping[str, Any],
     config: Any = None,
     intercept_layers: list[int] | None = None,
     modify_hook: Callable[[jax.Array, int], jax.Array] | None = None,
+    provenance: CheckpointProvenance | None = None,
 ) -> FrozenJAXSubstrate:
-    """Build a substrate directly from a state dict (HF naming) and an
-    optional HF config object."""
+
     params = state_dict_to_jax_pytree(state_dict)
     return FrozenJAXSubstrate(
         params=params,
         config=config,
         intercept_layers=intercept_layers,
         modify_hook=modify_hook,
+        provenance=provenance,
     )
-
 
 def architecture_from_params(params: Any, config: Any = None) -> Architecture:
     """Convenience alias for architecture detection."""

@@ -25,10 +25,12 @@ from .memory import (
     get_memory_status,
     maybe_reduce_batch_size,
 )
+from .provenance import CheckpointProvenance, resolve_checkpoint_provenance
 from .substrate import ForwardResult, FrozenJAXSubstrate
 
 __all__ = [
     "Architecture",
+    "CheckpointProvenance",
     "ForwardResult",
     "FrozenJAXSubstrate",
     "MemoryStatus",
@@ -41,6 +43,7 @@ __all__ = [
     "get_memory_status",
     "load_substrate_from_hf",
     "maybe_reduce_batch_size",
+    "resolve_checkpoint_provenance",
     "state_dict_to_jax_pytree",
     "validate_interception_layers",
 ]
