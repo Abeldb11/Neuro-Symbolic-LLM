@@ -12,6 +12,7 @@ from .architecture import (
     discover_layers,
     validate_interception_layers,
 )
+from .conversion import ConversionReport, convert_state_dict
 from .drift import compute_kl_drift
 from .loader import (
     build_substrate_from_state_dict,
@@ -25,10 +26,13 @@ from .memory import (
     get_memory_status,
     maybe_reduce_batch_size,
 )
+from .provenance import CheckpointProvenance, resolve_checkpoint_provenance
 from .substrate import ForwardResult, FrozenJAXSubstrate
 
 __all__ = [
     "Architecture",
+    "CheckpointProvenance",
+    "ConversionReport",
     "ForwardResult",
     "FrozenJAXSubstrate",
     "MemoryStatus",
@@ -36,11 +40,13 @@ __all__ = [
     "check_memory_headroom",
     "compute_kl_drift",
     "compute_memory_headroom",
+    "convert_state_dict",
     "detect_architecture",
     "discover_layers",
     "get_memory_status",
     "load_substrate_from_hf",
     "maybe_reduce_batch_size",
+    "resolve_checkpoint_provenance",
     "state_dict_to_jax_pytree",
     "validate_interception_layers",
 ]

@@ -29,6 +29,7 @@ from .memory import (
     maybe_reduce_batch_size,
 )
 from .models import run_embeddings, run_lm_head, run_transformer_blocks
+from .provenance import CheckpointProvenance
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,15 @@ class FrozenJAXSubstrate:
             callable overriding the default identity interception. Must be
             JIT-trace-safe (pure array math only).
         min_memory_headroom: headroom ratio below which a warning is emitted.
+        provenance: optional :class:`~substrate.provenance.CheckpointProvenance`
+            recording which HuggingFace checkpoint (model id + resolved
+            commit SHA) these params came from. ``load_substrate_from_hf``
+            fills this in automatically; callers building a substrate
+            directly from a state dict should supply it themselves if the
+            checkpoint's identity needs to stay verifiable. ``None`` means
+            "provenance was never recorded" -- deliberately distinct from a
+            resolved-but-unresolvable :class:`CheckpointProvenance`, which
+            at least records that resolution was attempted.
     """
 
     def __init__(
@@ -88,6 +98,7 @@ class FrozenJAXSubstrate:
         intercept_layers: Sequence[int] | None = None,
         modify_hook: Callable[[jax.Array, int], jax.Array] | None = None,
         min_memory_headroom: float = 0.5,
+        provenance: CheckpointProvenance | None = None,
     ) -> None:
         if not isinstance(params, Mapping):
             raise TypeError("params must be a mapping (nested param PyTree)")
@@ -98,6 +109,7 @@ class FrozenJAXSubstrate:
         )
         self._min_memory_headroom = float(min_memory_headroom)
         self._modify_hook = modify_hook
+        self._provenance = provenance
         # Params are stored as an immutable Flax FrozenDict. JAX arrays are
         # immutable, so this reference snapshot also captures the values; no
         # 2x copy is kept (memory-conscious).
@@ -114,6 +126,17 @@ class FrozenJAXSubstrate:
     @property
     def intercept_layers(self) -> tuple[int, ...]:
         return self._intercept_layers
+
+    @property
+    def provenance(self) -> CheckpointProvenance | None:
+        """Checkpoint identity this substrate was built from, if recorded.
+
+        None means provenance was never supplied at construction -- this is
+        distinct from a :class:`CheckpointProvenance` with ``resolved=False``,
+        which at least confirms resolution was attempted and records why it
+        failed.
+        """
+        return self._provenance
 
     @property
     def params(self) -> Any:
@@ -175,6 +198,9 @@ class FrozenJAXSubstrate:
                 "num_layers": self._architecture.num_layers,
                 "hidden_size": self._architecture.hidden_size,
             },
+            "provenance": (
+                self._provenance.as_dict() if self._provenance is not None else None
+            ),
         }
 
     # ── memory monitoring ───────────────────────────────────────────────────
@@ -235,8 +261,17 @@ class FrozenJAXSubstrate:
         return logits, intermediates
 
     def __repr__(self) -> str:
+        if self._provenance is not None and self._provenance.resolved:
+            checkpoint = (
+                f"{self._provenance.model_id}@{self._provenance.resolved_sha[:12]}"
+            )
+        elif self._provenance is not None:
+            checkpoint = f"{self._provenance.model_id}@UNRESOLVED"
+        else:
+            checkpoint = "unknown"
         return (
-            f"FrozenJAXSubstrate(model_family={self._architecture.model_family!r}, "
+            f"FrozenJAXSubstrate(checkpoint={checkpoint!r}, "
+            f"model_family={self._architecture.model_family!r}, "
             f"num_layers={self._architecture.num_layers}, "
             f"hidden_size={self._architecture.hidden_size}, "
             f"intercept_layers={list(self._intercept_layers)})"
