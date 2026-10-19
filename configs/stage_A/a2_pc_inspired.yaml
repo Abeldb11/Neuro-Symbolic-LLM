@@ -4,7 +4,10 @@
 #
 # L = L_task + lambda_kl*KL + lambda_wd*||phi||^2
 #   + lambda_cp*L_cpc + lambda_stab*(w_anch*L_zanch + w_hep*L_hep) + lambda_hid*L_hid
-# Set a weight to 0 to switch its term (and its heads) off
+# Set a weight to 0 to switch its term (and its heads) off; all of them at 0 is A1.
+# `monitor` only logs stability metrics (never part of the loss).
+# adapter / training / domains are the A1 sections, unchanged: A1 and A2 differ only in
+# `objective`, which is the point of the comparison.
 adapter:
   rank: 16              # LoRA-equivalent rank matching paper Sec 12.2 (r=16)
   activation: identity  # Linear residual adapter matching standard LoRA (BA) parameterization
@@ -39,7 +42,20 @@ objective:
       kind: fixed_random  # null | dense | lowrank | fixed_random (tied: not wired yet)
       rank: 16
       alpha: 1.0
-
+  # Hidden prediction: P_l(h~_l) predicts the next frozen block's output (stop-gradient target).
+  hid:
+    weight: 0.1         # lambda_hid; 0 switches the term and the predictors off
+    hidden_norm: target_var  # target_var (scale-free) | none (plain MSE)
+    skip_first_token: true   # position 0 has no left context
+    predictor:
+      ff_dim: 256       # hidden width of P_l = W2 GELU(W1 LN(u) + b1) + b2
+      out_init_std: null  # std of W2 at init (null: the FabricPC default)
+      predict_delta: false  # true: P_l(u) = u + MLP(u)
+      detach_input: false   # true: only P_l trains (negative control); false: the adapter too
+      layers: null      # null: every adapted layer that has a following block
+      seed: null        # null: objective.seed
+  # Stability metrics, logged but never in the loss: residual smoothness
+  # (res_smooth, input_smooth, res_vs_input) and the settling-step metrics (0 in A2).
   monitor:
     mode: diagnostic    # off | diagnostic
     layers: null        # null: every adapted layer
