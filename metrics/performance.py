@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -232,22 +232,24 @@ def multilabel_hit_metrics(
     probes cannot recover all gold labels, so recall is bounded by 1 / mean(|gold|); read
     ``hit_at_1`` and ``micro_precision`` as the primary numbers.
     """
-    golds = [set(int(x) for x in g) for g in gold_sets]
+    golds = [{int(x) for x in g} for g in gold_sets]
     preds = [int(x) for x in np.asarray(predictions).ravel()]
     if len(golds) != len(preds) or not golds:
         raise ValueError("need one prediction per (non-empty) gold set")
     if any(not 0 <= p < n_classes for p in preds):
         raise ValueError("prediction outside [0, n_classes)")
-    tp = sum(1 for g, p in zip(golds, preds) if p in g)
+    tp = sum(1 for g, p in zip(golds, preds, strict=True) if p in g)
     fp = len(preds) - tp
-    fn = sum(len(g) - (1 if p in g else 0) for g, p in zip(golds, preds))
+    fn = sum(len(g) - (1 if p in g else 0) for g, p in zip(golds, preds, strict=True))
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
     return {
         "hit_at_1": tp / len(golds),
         "micro_precision": precision,
         "micro_recall": recall,
-        "micro_f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
+        "micro_f1": (
+            2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        ),
     }
 
 
@@ -276,7 +278,10 @@ def backward_transfer(matrix: Any, t: int, *, higher_is_better: bool = True) -> 
 
 
 def heldout_transfer(
-    loss: Any, base_loss: Any, names: list[str] | None = None, min_in_domain: float = 0.02
+    loss: Any,
+    base_loss: Any,
+    names: list[str] | None = None,
+    min_in_domain: float = 0.02,
 ) -> dict[str, Any]:
     """Zero-shot transfer to domains the adapter has not been trained on yet.
 
@@ -291,7 +296,9 @@ def heldout_transfer(
     a = np.asarray(loss, dtype=float)
     base = np.asarray(base_loss, dtype=float)
     if a.ndim != 2 or a.shape[0] != a.shape[1] or base.shape != (a.shape[1],):
-        raise ValueError(f"loss must be square [T, T] and base_loss [T]; got {a.shape}, {base.shape}")
+        raise ValueError(
+            f"loss must be square [T, T] and base_loss [T]; got {a.shape}, {base.shape}"
+        )
     n = a.shape[0]
     names = names or [str(i) for i in range(n)]
     gain: list[list[float | None]] = [[None] * n for _ in range(n)]
@@ -316,7 +323,12 @@ def heldout_transfer(
             "gain": gain[n - 2][n - 1],
             "ratio": ratio[n - 2][n - 1],
         }
-    return {"gain": gain, "ratio": ratio, "per_checkpoint": per_checkpoint, "final": final}
+    return {
+        "gain": gain,
+        "ratio": ratio,
+        "per_checkpoint": per_checkpoint,
+        "final": final,
+    }
 
 
 def sequential_joint_gap(
@@ -338,7 +350,9 @@ def sequential_joint_gap(
     s = np.asarray(sequential, dtype=float)
     j = np.asarray(joint, dtype=float)
     if s.shape != j.shape or s.ndim != 1 or s.size == 0:
-        raise ValueError("sequential and joint must be equal-length non-empty 1-D arrays")
+        raise ValueError(
+            "sequential and joint must be equal-length non-empty 1-D arrays"
+        )
     gap = (j - s) if higher_is_better else (s - j)
     out: dict[str, Any] = {
         "gap": gap.tolist(),
@@ -351,8 +365,12 @@ def sequential_joint_gap(
             raise ValueError("base must match the shape of sequential")
         gain = (j - b) if higher_is_better else (b - j)
         rel = [
-            float(g / d) if np.isfinite(g) and np.isfinite(d) and d >= min_improvement else None
-            for g, d in zip(gap, gain)
+            (
+                float(g / d)
+                if np.isfinite(g) and np.isfinite(d) and d >= min_improvement
+                else None
+            )
+            for g, d in zip(gap, gain, strict=True)
         ]
         out["relative_gap"] = rel
         usable = [r for r in rel if r is not None]
@@ -363,7 +381,9 @@ def sequential_joint_gap(
 # =============================================================================
 # Anchor drift and long-range behaviour
 # =============================================================================
-def anchor_drift(kl_by_checkpoint: Any, loss_by_checkpoint: Any, base_loss: float) -> dict[str, Any]:
+def anchor_drift(
+    kl_by_checkpoint: Any, loss_by_checkpoint: Any, base_loss: float
+) -> dict[str, Any]:
     """Drift from the frozen model on a fixed anchor corpus, at every checkpoint.
 
     ``kl_by_checkpoint[t]``: KL(base || adapted) after task ``t``; ``loss_by_checkpoint[t]``:
@@ -383,7 +403,9 @@ def anchor_drift(kl_by_checkpoint: Any, loss_by_checkpoint: Any, base_loss: floa
     }
 
 
-def position_loss_profile(logits: jax.Array, labels: jax.Array, n_buckets: int = 4) -> np.ndarray:
+def position_loss_profile(
+    logits: jax.Array, labels: jax.Array, n_buckets: int = 4
+) -> np.ndarray:
     """Mean next-token loss per position bucket (early ... late) of a long sequence."""
     if logits.ndim != 3 or labels.ndim != 2 or logits.shape[:2] != labels.shape:
         raise ValueError("expected logits [B,T,V] and labels [B,T]")
@@ -392,9 +414,16 @@ def position_loss_profile(logits: jax.Array, labels: jax.Array, n_buckets: int =
     logp = jax.nn.log_softmax(logits[:, :-1].astype(jnp.float32), axis=-1)
     target = labels[:, 1:]
     mask = (target != -100).astype(jnp.float32)
-    nll = -jnp.take_along_axis(logp, jnp.where(target != -100, target, 0)[..., None], axis=-1)[..., 0]
-    per_pos = np.asarray(jnp.sum(nll * mask, axis=0) / jnp.maximum(jnp.sum(mask, axis=0), 1.0))
-    return np.array([c.mean() for c in np.array_split(per_pos, n_buckets)])
+    nll = -jnp.take_along_axis(
+        logp, jnp.where(target != -100, target, 0)[..., None], axis=-1
+    )[..., 0]
+    per_pos = np.asarray(
+        jnp.sum(nll * mask, axis=0) / jnp.maximum(jnp.sum(mask, axis=0), 1.0)
+    )
+    return cast(
+        np.ndarray,
+        np.asarray([c.mean() for c in np.array_split(per_pos, n_buckets)], dtype=float),
+    )
 
 
 def long_range_summary(adapted_profile: Any, base_profile: Any) -> dict[str, Any]:

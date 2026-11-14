@@ -361,8 +361,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             selected_sets = {task.name: task.eval_set for task in domains}
         else:
             raise ValueError(
-                "Runtime checkpoint evaluation supports "
-                "'test' and 'validation' splits."
+                "Runtime checkpoint evaluation supports 'test' and 'validation' splits."
             )
 
         results = {

@@ -209,7 +209,7 @@ def _image_markdown(path: Path, report_dir: Path, alt: str, plt_available: bool)
 
 
 def _condition_key(
-    record: Mapping[str, Any]
+    record: Mapping[str, Any],
 ) -> tuple[str, int, tuple[str, ...], tuple[str, ...]]:
     return (
         str(record.get("protocol", "sequential")),

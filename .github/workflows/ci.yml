@@ -83,3 +83,12 @@ jobs:
           tests/benchmark/test_evaluation.py
           tests/benchmark/test_benchmark.py
           -v --tb=short
+
+      - name: Run external-metric tests
+        run: >-
+          python -m pytest
+          tests/residual/metrics/test_external_core.py
+          tests/residual/metrics/test_external_performance.py
+          tests/residual/metrics/test_performance.py
+          tests/residual/stage_A/test_shared_external_eval.py
+          -v --tb=short

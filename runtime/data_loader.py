@@ -11,7 +11,7 @@ import hashlib
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import yaml
@@ -89,7 +89,9 @@ class LabeledSplit:
     fingerprint: str
 
     def probe_targets(self) -> np.ndarray:
-        return self.targets if self.multilabel else np.argmax(self.targets, axis=1)
+        if self.multilabel:
+            return cast(np.ndarray, np.asarray(self.targets))
+        return cast(np.ndarray, np.argmax(self.targets, axis=1))
 
 
 # ---------------------------------------------------------------------
@@ -452,9 +454,12 @@ def encode_texts(
         add_special_tokens=True,
     )
 
-    return np.asarray(
-        encoded["input_ids"][0],
-        dtype=np.int32,
+    return cast(
+        np.ndarray,
+        np.asarray(
+            encoded["input_ids"][0],
+            dtype=np.int32,
+        ),
     )
 
 
@@ -1007,6 +1012,7 @@ def load_runtime_data(
     if not source_tasks:
         raise ValueError("At least one non-held-out training task is required")
 
+    training_tasks: tuple[Domain, ...]
     if training_mode == "joint":
         expanded = [
             np.tile(

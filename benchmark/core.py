@@ -119,11 +119,23 @@ EXTERNAL_METRIC_SPECS = (
     ("Task micro-F1, label-token probe", "ext_task_micro_f1", "higher"),
     ("Task ECE, label-token probe", "ext_task_ece", "lower"),
     ("Backward transfer, loss (negative = forgetting)", "ext_bwt_loss", "higher"),
-    ("Backward transfer, accuracy (negative = forgetting)", "ext_bwt_accuracy", "higher"),
-    ("Zero-shot gain on the last domain (checkpoint matrix)", "ext_zero_shot_gain", "higher"),
+    (
+        "Backward transfer, accuracy (negative = forgetting)",
+        "ext_bwt_accuracy",
+        "higher",
+    ),
+    (
+        "Zero-shot gain on the last domain (checkpoint matrix)",
+        "ext_zero_shot_gain",
+        "higher",
+    ),
     ("Zero-shot gain ratio to in-domain gain", "ext_zero_shot_ratio", "higher"),
     ("Gain on never-trained domains (held-out protocol)", "ext_unseen_gain", "higher"),
-    ("Sequential minus joint, relative gap (guarded)", "ext_joint_gap_relative", "lower"),
+    (
+        "Sequential minus joint, relative gap (guarded)",
+        "ext_joint_gap_relative",
+        "lower",
+    ),
     ("Anchor KL, wikitext, final", "ext_anchor_kl_final", "lower"),
     ("Anchor KL, wikitext, peak", "ext_anchor_kl_peak", "lower"),
     ("Anchor loss change, wikitext, final", "ext_anchor_loss_change", "lower"),
@@ -214,7 +226,10 @@ def _load_external_settings() -> dict[str, Any]:
 
 
 def _external_probe_sets(
-    tokenizer: Any, runtime_config: dict[str, Any], settings: dict[str, Any], seq_len: int
+    tokenizer: Any,
+    runtime_config: dict[str, Any],
+    settings: dict[str, Any],
+    seq_len: int,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     """Labelled test examples per legal task, from the pinned ``legal_task`` specs."""
     from runtime.data_loader import legal_task_specs, load_labeled_split
@@ -228,7 +243,11 @@ def _external_probe_sets(
     for spec in legal_task_specs(runtime_config):
         try:
             split = load_labeled_split(
-                spec, "test", tokenizer, sequence_length=seq_len, max_examples=max_examples
+                spec,
+                "test",
+                tokenizer,
+                sequence_length=seq_len,
+                max_examples=max_examples,
             )
             from stages.stage_base import probe_examples_from_split
 
@@ -237,10 +256,11 @@ def _external_probe_sets(
                 raise ValueError("no labelled test examples")
             width = max(len(t) for t in token_ids)
             token_matrix = np.asarray(
-                [list(t) + [t[-1]] * (width - len(t)) for t in token_ids], dtype=np.int32
+                [list(t) + [t[-1]] * (width - len(t)) for t in token_ids],
+                dtype=np.int32,
             )
-            ids = np.stack([np.asarray(e[0], dtype=np.int32) for e in examples])
-            positions = np.asarray([e[2] for e in examples], dtype=np.int32)
+            ids: Any = np.stack([np.asarray(e[0], dtype=np.int32) for e in examples])
+            positions: Any = np.asarray([e[2] for e in examples], dtype=np.int32)
             targets = [e[1] for e in examples]
             keep = list(range(len(examples)))
             sets[spec.name] = {
@@ -257,11 +277,16 @@ def _external_probe_sets(
                 "multilabel": bool(split.multilabel),
             }
         except Exception as exc:  # dataset/network problems must not abort the run
-            status[spec.name] = {"status": "skipped", "reason": f"{type(exc).__name__}: {exc}"[:300]}
+            status[spec.name] = {
+                "status": "skipped",
+                "reason": f"{type(exc).__name__}: {exc}"[:300],
+            }
     return sets, status
 
 
-def _run_external_probe(deployed: Any, params: Any, probe: dict[str, Any], batch_size: int = 16) -> dict[str, float]:
+def _run_external_probe(
+    deployed: Any, params: Any, probe: dict[str, Any], batch_size: int = 16
+) -> dict[str, float]:
     """Label-token classification probe: accuracy, macro/micro-F1 and class-level ECE."""
     import jax.numpy as jnp
 
@@ -285,9 +310,13 @@ def _run_external_probe(deployed: Any, params: Any, probe: dict[str, Any], batch
     targets = probe["targets"]
     if probe["multilabel"]:
         m = multilabel_hit_metrics(targets, predictions, int(token_matrix.shape[0]))
-        correct = np.array([int(p in g) for g, p in zip(targets, predictions)])
+        correct = np.array(
+            [int(p in g) for g, p in zip(targets, predictions, strict=True)]
+        )
         out = {
-            "task_accuracy": m["hit_at_1"],  # hit@1: the predicted label is a gold label
+            "task_accuracy": m[
+                "hit_at_1"
+            ],  # hit@1: the predicted label is a gold label
             "task_f1": m["micro_f1"],
             "task_micro_f1": m["micro_f1"],
         }
@@ -296,28 +325,44 @@ def _run_external_probe(deployed: Any, params: Any, probe: dict[str, Any], batch
         m = classification_metrics(y, predictions)
         correct = (predictions == y).astype(int)
         # Single-label multiclass: micro-F1 equals accuracy.
-        out = {"task_accuracy": m["accuracy"], "task_f1": m["macro_f1"], "task_micro_f1": m["accuracy"]}
+        out = {
+            "task_accuracy": m["accuracy"],
+            "task_f1": m["macro_f1"],
+            "task_micro_f1": m["accuracy"],
+        }
     ece = calibration_from_predictions(confidence, correct)["ece"]
     if ece is not None:
         out["task_ece"] = float(ece)
     return {k: float(v) for k, v in out.items()}
 
 
-def _external_anchor_batches(substrate: Any, settings: dict[str, Any], training: Any) -> tuple[Any, str | None]:
-    from runtime.data_loader import extract_texts, load_dataset_split, make_eval_set, tokenize_texts
+def _external_anchor_batches(
+    substrate: Any, settings: dict[str, Any], training: Any
+) -> tuple[Any, str | None]:
+    from runtime.data_loader import (
+        extract_texts,
+        load_dataset_split,
+        make_eval_set,
+        tokenize_texts,
+    )
 
     cfg = settings.get("anchor")
     if not cfg:
         return None, "no anchor section in benchmark_eval.yaml"
     try:
         dataset = load_dataset_split(
-            cfg["dataset"], cfg.get("split", "validation"),
-            dataset_config=cfg.get("config"), revision=cfg.get("revision"),
+            cfg["dataset"],
+            cfg.get("split", "validation"),
+            dataset_config=cfg.get("config"),
+            revision=cfg.get("revision"),
         )
         texts = extract_texts(dataset, cfg.get("text_field", "text"))
         blocks = tokenize_texts(
-            texts, substrate.tokenizer, sequence_length=training.seq_len,
-            separator=cfg.get("separator", "\n\n"), task_name="anchor",
+            texts,
+            substrate.tokenizer,
+            sequence_length=training.seq_len,
+            separator=cfg.get("separator", "\n\n"),
+            task_name="anchor",
         )
         n_batches = max(1, -(-int(cfg.get("max_blocks", 64)) // training.batch_size))
         return make_eval_set(blocks, training.batch_size, n_batches), None
@@ -343,14 +388,22 @@ def _external_long_range_sets(
         for name, item in items.items():
             texts = load_split_texts(item, item["test_split"])
             blocks = tokenize_texts(
-                texts, substrate.tokenizer, sequence_length=seq_len,
-                separator=str(item.get("separator", "\n\n")), task_name=name, allow_empty=True,
+                texts,
+                substrate.tokenizer,
+                sequence_length=seq_len,
+                separator=str(item.get("separator", "\n\n")),
+                task_name=name,
+                allow_empty=True,
             )
             if len(blocks):
-                sets[name] = make_eval_set(blocks, batch, max(1, -(-int(cfg.get("max_blocks", 16)) // batch)))
+                sets[name] = make_eval_set(
+                    blocks, batch, max(1, -(-int(cfg.get("max_blocks", 16)) // batch))
+                )
     except Exception as exc:
         return {}, f"{type(exc).__name__}: {exc}"[:300]
-    return sets, (None if sets else "no domain has enough tokens for the long-range proxy")
+    return sets, (
+        None if sets else "no domain has enough tokens for the long-range proxy"
+    )
 
 
 def _external_evaluation(
@@ -397,8 +450,12 @@ def _external_evaluation(
 
     def domain_row(params: Any, batches: Any) -> dict[str, float]:
         if not batches:
-            return {k: float("nan") for k in ("loss", "token_accuracy", "kl", "ece", "base_loss")}
-        losses, base_losses, accs, kls, pooled = [], [], [], [], None
+            return {
+                k: float("nan")
+                for k in ("loss", "token_accuracy", "kl", "ece", "base_loss")
+            }
+        losses, base_losses, accs, kls = [], [], [], []
+        pooled: tuple[Any, Any, Any] | None = None
         for ids in batches:
             base, adapted = deployed(params, ids)
             losses.append(ce(adapted, ids))
@@ -406,13 +463,19 @@ def _external_evaluation(
             accs.append(float(token_accuracy(adapted, ids)))
             kls.append(float(kl_to_base(base, adapted)))
             stats = calibration_stats(adapted, ids)
-            pooled = stats if pooled is None else tuple(a + b for a, b in zip(pooled, stats))
+            pooled = (
+                stats
+                if pooled is None
+                else (pooled[0] + stats[0], pooled[1] + stats[1], pooled[2] + stats[2])
+            )
         return {
             "loss": float(np.mean(losses)),
             "base_loss": float(np.mean(base_losses)),
             "token_accuracy": float(np.mean(accs)),
             "kl": float(np.mean(kls)),
-            "ece": float(ece_from_stats(*pooled)),
+            "ece": (
+                float(ece_from_stats(*pooled)) if pooled is not None else float("nan")
+            ),
         }
 
     keys = ("loss", "token_accuracy", "ece", "kl")
@@ -426,7 +489,11 @@ def _external_evaluation(
         for k in keys:
             matrices[k].append([rows[d][k] for d in domains])
         probes = {
-            d: (_run_external_probe(deployed, params, probe_sets[d]) if d in probe_sets else {})
+            d: (
+                _run_external_probe(deployed, params, probe_sets[d])
+                if d in probe_sets
+                else {}
+            )
             for d in domains
         }
         for k in task_keys:
@@ -447,17 +514,22 @@ def _external_evaluation(
         "base_loss": base_loss,
         "matrices": {k: (v if has_values(v) else None) for k, v in matrices.items()},
         "probe": probe_status,
-        "final": {k: dict(zip(domains, v[-1])) for k, v in matrices.items() if has_values(v)},
+        "final": {
+            k: dict(zip(domains, v[-1], strict=True))
+            for k, v in matrices.items()
+            if has_values(v)
+        },
     }
-    loss_m = np.asarray(matrices["loss"], dtype=float)
-    acc_m = np.asarray(matrices["task_accuracy"], dtype=float)
+    loss_m: Any = np.asarray(matrices["loss"], dtype=float)
+    acc_m: Any = np.asarray(matrices["task_accuracy"], dtype=float)
     square = bool(trained) and len(trained) == n_ckpt and n_ckpt >= 2
     reason = "needs one checkpoint per trained domain (sequential or held-out protocol)"
     if square:
         sub_loss, sub_acc = loss_m[:, :n_ckpt], acc_m[:, :n_ckpt]
         sub_base = np.asarray(base_loss[:n_ckpt], dtype=float)
         out["backward_transfer_loss"] = [None] + [
-            or_none(backward_transfer(sub_loss, t, higher_is_better=False)) for t in range(1, n_ckpt)
+            or_none(backward_transfer(sub_loss, t, higher_is_better=False))
+            for t in range(1, n_ckpt)
         ]
         out["backward_transfer_accuracy"] = (
             [None] + [or_none(backward_transfer(sub_acc, t)) for t in range(1, n_ckpt)]
@@ -477,7 +549,10 @@ def _external_evaluation(
             ),
         }
     else:
-        out["unseen_transfer"] = {"status": "unavailable", "reason": "no domain was held out of training"}
+        out["unseen_transfer"] = {
+            "status": "unavailable",
+            "reason": "no domain was held out of training",
+        }
 
     if anchor_batches:
         a_kl, a_loss = [], []
@@ -486,10 +561,17 @@ def _external_evaluation(
             a_kl.append(row["kl"])
             a_loss.append(row["loss"])
         a_base = domain_row(checkpoint_params[0], anchor_batches)["base_loss"]
-        out["anchor"] = {"status": "measured", "n_batches": len(anchor_batches), "base_loss": a_base,
-                         **anchor_drift(a_kl, a_loss, a_base)}
+        out["anchor"] = {
+            "status": "measured",
+            "n_batches": len(anchor_batches),
+            "base_loss": a_base,
+            **anchor_drift(a_kl, a_loss, a_base),
+        }
     else:
-        out["anchor"] = {"status": "unavailable", "reason": anchor_reason or "no anchor corpus"}
+        out["anchor"] = {
+            "status": "unavailable",
+            "reason": anchor_reason or "no anchor corpus",
+        }
 
     if long_range_sets:
         final = checkpoint_params[-1]
@@ -500,16 +582,25 @@ def _external_evaluation(
                 base, adapted = deployed(final, ids)
                 adapted_profiles.append(position_loss_profile(adapted, ids, n_buckets))
                 base_profiles.append(position_loss_profile(base, ids, n_buckets))
-            per_domain[d] = long_range_summary(np.mean(adapted_profiles, axis=0), np.mean(base_profiles, axis=0))
+            per_domain[d] = long_range_summary(
+                np.mean(adapted_profiles, axis=0), np.mean(base_profiles, axis=0)
+            )
         out["long_range_proxy"] = {
             "status": "measured",
             "note": "position-bucketed loss proxy; not a long-context benchmark",
             "per_domain": per_domain,
-            "mean_delta_vs_base": float(np.mean([v["delta_vs_base"] for v in per_domain.values()])),
-            "mean_late_loss_change": float(np.mean([v["late_loss_change"] for v in per_domain.values()])),
+            "mean_delta_vs_base": float(
+                np.mean([v["delta_vs_base"] for v in per_domain.values()])
+            ),
+            "mean_late_loss_change": float(
+                np.mean([v["late_loss_change"] for v in per_domain.values()])
+            ),
         }
     else:
-        out["long_range_proxy"] = {"status": "unavailable", "reason": long_range_reason or "not configured"}
+        out["long_range_proxy"] = {
+            "status": "unavailable",
+            "reason": long_range_reason or "not configured",
+        }
     return out
 
 
@@ -536,10 +627,14 @@ def _external_block(
         probe_sets, probe_status = _external_probe_sets(
             substrate.tokenizer, runtime_config, settings, training.seq_len
         )
-        anchor_batches, anchor_reason = _external_anchor_batches(substrate, settings, training)
+        anchor_batches, anchor_reason = _external_anchor_batches(
+            substrate, settings, training
+        )
         long_sets, long_reason = _external_long_range_sets(substrate, items, settings)
         return _external_evaluation(
-            ce=lambda logits, ids: float(substrate.compute_loss(logits, ids, losses=("CE",))),
+            ce=lambda logits, ids: float(
+                substrate.compute_loss(logits, ids, losses=("CE",))
+            ),
             deployed=lambda p, ids: deployed_with_params(p, ids)[:2],
             checkpoint_tasks=[str(r["task"]) for r in checkpoint_rows],
             checkpoint_params=[r["params"] for r in checkpoint_rows],
@@ -565,17 +660,37 @@ def _attach_external_joint_gap(records: list[dict[str, Any]]) -> None:
         return (ext.get("final") or {}).get(key)
 
     joint = {
-        (r["method"], r["seed"], r["rank"], r.get("k"), tuple(r.get("task_order", ()))): r
+        (
+            r["method"],
+            r["seed"],
+            r["rank"],
+            r.get("k"),
+            tuple(r.get("task_order", ())),
+        ): r
         for r in records
         if r.get("protocol") == "joint" and r.get("status") != "invalid"
     }
     for rec in records:
-        if rec.get("protocol") != "sequential" or rec.get("status") == "invalid" or rec.get("heldout_tasks"):
+        if (
+            rec.get("protocol") != "sequential"
+            or rec.get("status") == "invalid"
+            or rec.get("heldout_tasks")
+        ):
             continue
-        mate = joint.get((rec["method"], rec["seed"], rec["rank"], rec.get("k"), tuple(rec.get("task_order", ()))))
+        mate = joint.get(
+            (
+                rec["method"],
+                rec["seed"],
+                rec["rank"],
+                rec.get("k"),
+                tuple(rec.get("task_order", ())),
+            )
+        )
         if mate is None:
             continue
-        if rec.get("steps") != mate.get("steps") or rec.get("tokens") != mate.get("tokens"):
+        if rec.get("steps") != mate.get("steps") or rec.get("tokens") != mate.get(
+            "tokens"
+        ):
             rec["external_joint_gap"] = {"status": "invalid_budget_mismatch"}
             continue
         gap: dict[str, Any] = {"status": "measured", "joint_run_id": mate["run_id"]}
@@ -586,18 +701,33 @@ def _attach_external_joint_gap(records: list[dict[str, Any]]) -> None:
             seq, jnt = final(rec, key), final(mate, key)
             if not seq or not jnt:
                 continue
-            common = [d for d in seq if d in jnt and np.isfinite(seq[d]) and np.isfinite(jnt[d])]
+            common = [
+                d
+                for d in seq
+                if d in jnt and np.isfinite(seq[d]) and np.isfinite(jnt[d])
+            ]
             if not common:
                 continue
             base_vals = (
                 [base[order.index(d)] for d in common]
-                if key == "loss" and all(d in order for d in common) and len(base) == len(order)
+                if key == "loss"
+                and all(d in order for d in common)
+                and len(base) == len(order)
                 else None
             )
-            result = sequential_joint_gap([seq[d] for d in common], [jnt[d] for d in common], base_vals, higher_is_better=higher)
+            result = sequential_joint_gap(
+                [seq[d] for d in common],
+                [jnt[d] for d in common],
+                base_vals,
+                higher_is_better=higher,
+            )
             result["domains"] = common
             gap[key] = result
-        rec["external_joint_gap"] = gap if len(gap) > 2 else {"status": "unavailable", "reason": "no comparable deployed metrics"}
+        rec["external_joint_gap"] = (
+            gap
+            if len(gap) > 2
+            else {"status": "unavailable", "reason": "no comparable deployed metrics"}
+        )
 
 
 def _load_deployed_metrics(
@@ -2063,15 +2193,27 @@ def _report_metric_value(record: dict[str, Any], metric: str, rank: int) -> list
             "ext_task_ece": final.get("task_ece"),
             "ext_bwt_loss": last(external.get("backward_transfer_loss")),
             "ext_bwt_accuracy": last(external.get("backward_transfer_accuracy")),
-            "ext_zero_shot_gain": ((external.get("heldout_transfer") or {}).get("final") or {}).get("gain"),
-            "ext_zero_shot_ratio": ((external.get("heldout_transfer") or {}).get("final") or {}).get("ratio"),
+            "ext_zero_shot_gain": (
+                (external.get("heldout_transfer") or {}).get("final") or {}
+            ).get("gain"),
+            "ext_zero_shot_ratio": (
+                (external.get("heldout_transfer") or {}).get("final") or {}
+            ).get("ratio"),
             "ext_unseen_gain": (external.get("unseen_transfer") or {}).get("mean_gain"),
-            "ext_unseen_ratio": (external.get("unseen_transfer") or {}).get("mean_ratio"),
-            "ext_joint_gap_relative": ((record.get("external_joint_gap") or {}).get("loss") or {}).get("mean_relative_gap"),
+            "ext_unseen_ratio": (external.get("unseen_transfer") or {}).get(
+                "mean_ratio"
+            ),
+            "ext_joint_gap_relative": (
+                (record.get("external_joint_gap") or {}).get("loss") or {}
+            ).get("mean_relative_gap"),
             "ext_anchor_kl_final": (external.get("anchor") or {}).get("final_kl"),
             "ext_anchor_kl_peak": (external.get("anchor") or {}).get("peak_kl"),
-            "ext_anchor_loss_change": (external.get("anchor") or {}).get("final_loss_change"),
-            "ext_long_range_proxy": (external.get("long_range_proxy") or {}).get("mean_delta_vs_base"),
+            "ext_anchor_loss_change": (external.get("anchor") or {}).get(
+                "final_loss_change"
+            ),
+            "ext_long_range_proxy": (external.get("long_range_proxy") or {}).get(
+                "mean_delta_vs_base"
+            ),
         }.get(metric)
     elif metric == "trainable_params":
         value = record.get("trainable_params")

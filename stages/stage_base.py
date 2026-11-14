@@ -315,9 +315,7 @@ def load_task_examples(
         )
     label_token_ids = []
     for verbalizer in verbalizers:
-        ids = substrate.tokenizer.encode(
-            f" {verbalizer}", add_special_tokens=False
-        )
+        ids = substrate.tokenizer.encode(f" {verbalizer}", add_special_tokens=False)
         if not ids:
             raise ValueError(f"{domain.name}: label token {verbalizer!r} is empty")
         label_token_ids.append(tuple(int(token_id) for token_id in ids))
@@ -497,12 +495,20 @@ def evaluate(
         loss = substrate.compute_loss(adapted, ids, losses=("CE",))
         kl = substrate.compute_loss(adapted, ids, losses=("KL",), base_logits=base)
         conf_sum, acc_sum, counts = calibration_stats(adapted, ids)
-        return base_loss, loss, kl, token_accuracy(adapted, ids), conf_sum, acc_sum, counts
+        return (
+            base_loss,
+            loss,
+            kl,
+            token_accuracy(adapted, ids),
+            conf_sum,
+            acc_sum,
+            counts,
+        )
 
     eval_step = jax.jit(_eval_step) if jit else _eval_step
 
     base_losses, losses, kls, accs = [], [], [], []
-    pooled = None
+    pooled: tuple[Any, Any, Any] | None = None
     for ids in eval_batches:
         b_loss, a_loss, kl, acc, conf_sum, acc_sum, counts = eval_step(params, ids)
         base_losses.append(float(b_loss))
@@ -510,7 +516,11 @@ def evaluate(
         kls.append(float(kl))
         accs.append(float(acc))
         stats = (conf_sum, acc_sum, counts)
-        pooled = stats if pooled is None else tuple(a + b for a, b in zip(pooled, stats))
+        pooled = (
+            stats
+            if pooled is None
+            else (pooled[0] + stats[0], pooled[1] + stats[1], pooled[2] + stats[2])
+        )
     base_loss, loss = float(np.mean(base_losses)), float(np.mean(losses))
     return {
         "base_loss": base_loss,
@@ -520,13 +530,13 @@ def evaluate(
         "kl": float(np.mean(kls)),
         "token_accuracy": float(np.mean(accs)),
         # Pooled over all eval batches so bins are not averaged batch-by-batch.
-        "ece": float(ece_from_stats(*pooled)) if pooled is not None else 0.0,
+        "ece": float(ece_from_stats(*pooled)) if pooled is not None else float("nan"),
     }
 
 
 def evaluate_task(
     substrate: FrozenSubstrate,
-    adapter: ResidualAdapter,
+    adapter: ResidualAdapter | None,
     params: AdapterParams,
     examples: Sequence[tuple[jax.Array, Any, int]],
     label_token_ids: Sequence[Sequence[int]],
@@ -556,6 +566,8 @@ def evaluate_task(
         if logits_fn is not None:
             logits = logits_fn(params, ids)
         else:
+            if adapter is None:
+                raise ValueError("evaluate_task needs an adapter or a logits_fn")
             logits = substrate.run_with_interception(
                 ids,
                 modify_fn=adapter.modify_fn(params),
@@ -569,7 +581,9 @@ def evaluate_task(
     raw_targets = [example[1] for example in examples]
     if isinstance(raw_targets[0], tuple):
         metrics = multilabel_hit_metrics(raw_targets, predictions, len(label_token_ids))
-        correct = np.array([int(p in g) for g, p in zip(raw_targets, predictions)])
+        correct = np.array(
+            [int(p in g) for g, p in zip(raw_targets, predictions, strict=True)]
+        )
         out = {
             "task_accuracy": metrics["hit_at_1"],
             "task_f1": metrics["micro_f1"],
@@ -587,9 +601,11 @@ def evaluate_task(
             "task_micro_f1": metrics["accuracy"],  # single-label: micro-F1 == accuracy
         }
     calibration = calibration_from_predictions(confidence, correct)
-    if calibration["ece"] is not None:
-        out["task_ece"] = float(calibration["ece"])
-        out["task_mean_confidence"] = float(calibration["mean_confidence"])
+    ece_value = calibration["ece"]
+    confidence_value = calibration["mean_confidence"]
+    if ece_value is not None and confidence_value is not None:
+        out["task_ece"] = float(ece_value)
+        out["task_mean_confidence"] = float(confidence_value)
     return out
 
 
@@ -650,9 +666,7 @@ def summarize(
     task_accuracy = np.array(
         [[row[n].get("task_accuracy", np.nan) for n in names] for row in rows]
     )
-    task_f1 = np.array(
-        [[row[n].get("task_f1", np.nan) for n in names] for row in rows]
-    )
+    task_f1 = np.array([[row[n].get("task_f1", np.nan) for n in names] for row in rows])
     base_loss = [init[n]["base_loss"] for n in names]
     num_tasks = len(rows)
     has_task_metrics = bool(np.isfinite(task_accuracy).any())
@@ -661,9 +675,7 @@ def summarize(
         accuracy_forgetting_values = [None]
         for t in range(1, num_tasks):
             val = float(accuracy_forgetting(task_accuracy, t))
-            accuracy_forgetting_values.append(
-                val if math.isfinite(val) else None
-            )
+            accuracy_forgetting_values.append(val if math.isfinite(val) else None)
 
     skipped: dict[str, str] = {}
     for j, n in enumerate(names):
@@ -687,7 +699,9 @@ def summarize(
             skipped[n] = reason
 
     def _matrix(key: str) -> np.ndarray:
-        return np.array([[row[n].get(key, np.nan) for n in names] for row in rows])
+        return np.asarray(
+            [[row[n].get(key, np.nan) for n in names] for row in rows], dtype=float
+        )
 
     def _or_none(matrix: np.ndarray) -> list[list[float]] | None:
         return matrix.tolist() if np.isfinite(matrix).any() else None
@@ -700,7 +714,7 @@ def summarize(
     def _bwt(matrix: np.ndarray, *, higher: bool) -> list[float | None] | None:
         if not square or not np.isfinite(matrix).any():
             return None
-        values = [None]
+        values: list[float | None] = [None]
         for t in range(1, num_tasks):
             v = float(backward_transfer(matrix, t, higher_is_better=higher))
             values.append(v if math.isfinite(v) else None)
@@ -722,10 +736,7 @@ def summarize(
         "mean_seen_loss": [float(mean_seen_loss(loss, t)) for t in range(num_tasks)],
         # Undefined at t=0 (no earlier task), stored as null.
         "mean_forgetting": [None]
-        + [
-            float(mean_forgetting(loss, t))
-            for t in range(1, num_tasks)
-        ],
+        + [float(mean_forgetting(loss, t)) for t in range(1, num_tasks)],
         "task_accuracy": task_accuracy.tolist() if has_task_metrics else None,
         "task_f1": task_f1.tolist() if np.isfinite(task_f1).any() else None,
         "accuracy_forgetting": accuracy_forgetting_values,
@@ -775,7 +786,7 @@ def probe_examples_from_split(
         token_ids.append(tuple(int(t) for t in encoded))
     positions = np.asarray(split.attention_mask).sum(axis=1) - 1
     targets: list[Any] = (
-        [tuple(int(i) for i in np.flatnonzero(row)) for row in split.targets]
+        [tuple(i for i, flag in enumerate(row) if flag) for row in split.targets]
         if split.multilabel
         else [int(i) for i in split.probe_targets()]
     )
@@ -803,12 +814,18 @@ def attach_task_probes(
     """
     from dataclasses import replace
 
-    from runtime.data_loader import legal_task_specs, load_labeled_split, load_runtime_config
+    from runtime.data_loader import (
+        legal_task_specs,
+        load_labeled_split,
+        load_runtime_config,
+    )
 
     settings = load_probe_settings()
     if settings.get("enabled", True) is False:
         return runtime_data
-    max_examples = int(settings.get("stage_max_examples", settings.get("max_examples", 200)))
+    max_examples = int(
+        settings.get("stage_max_examples", settings.get("max_examples", 200))
+    )
     specs = {
         spec.name: spec
         for spec in legal_task_specs(load_runtime_config(runtime_config_path))
@@ -828,7 +845,9 @@ def attach_task_probes(
                 max_examples=max_examples,
             )
             examples, token_ids = probe_examples_from_split(split, tokenizer)
-            reason = None if examples else f"{task.name}: no labelled validation examples"
+            reason = (
+                None if examples else f"{task.name}: no labelled validation examples"
+            )
         except Exception as exc:  # dataset problems must not abort training
             examples, token_ids = (), ()
             reason = f"{task.name}: {type(exc).__name__}: {exc}"[:300]
@@ -864,6 +883,7 @@ def make_eval_fn(
 
     def eval_fn(params: Any, eval_set: Sequence[jax.Array]) -> dict[str, Any]:
         adapter_params = params if params_fn is None else params_fn(params)
+        result: dict[str, Any]
         if evaluate_fn is not None:
             result = evaluate_fn(params, eval_set)
         else:
