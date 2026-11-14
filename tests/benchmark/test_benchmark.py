@@ -144,10 +144,22 @@ def test_a3_k_sweep_curves_do_not_overwrite(tmp_path: Path) -> None:
     _write_json(tmp_path / "manifest.json", manifest)
     (tmp_path / "cfg.yaml").write_text("adapter:\n  rank: 16\n", encoding="utf-8")
 
-    _write_json(tmp_path / "r1.json", {"base_loss": [3.0], "loss": [[2.8]]})
-    _write_json(tmp_path / "r2.json", {"base_loss": [3.0], "loss": [[2.6]]})
-    _write_json(tmp_path / "r3.json", {"base_loss": [3.0], "loss": [[2.7]]})
-    _write_json(tmp_path / "r4.json", {"base_loss": [3.0], "loss": [[2.4]]})
+    _write_json(
+        tmp_path / "r1.json",
+        {"domains": ["d1"], "base_loss": [3.0], "loss": [[2.8]]},
+    )
+    _write_json(
+        tmp_path / "r2.json",
+        {"domains": ["d1"], "base_loss": [3.0], "loss": [[2.6]]},
+    )
+    _write_json(
+        tmp_path / "r3.json",
+        {"domains": ["d1"], "base_loss": [3.0], "loss": [[2.7]]},
+    )
+    _write_json(
+        tmp_path / "r4.json",
+        {"domains": ["d1"], "base_loss": [3.0], "loss": [[2.4]]},
+    )
 
     evaluation = evaluate_manifest(tmp_path)
     records_by_id = {r["run_id"]: r for r in evaluation["records"]}
@@ -529,16 +541,16 @@ def test_runtime_source_override_ignores_yaml_default(
     monkeypatch.setattr(data_loader, "build_separate_tasks", fake_separate)
     monkeypatch.setattr(data_loader, "build_story_tasks", fail_stories)
 
-    runtime_data = data_loader.load_runtime_data(
-        DEFAULT_RUNTIME_CONFIG,
-        tokenizer=object(),
-        source="separate",
-        sequence_length=2,
-        batch_size=1,
-        eval_batches=1,
-    )
+    with pytest.raises(ValueError, match="non-held-out training task"):
+        data_loader.load_runtime_data(
+            DEFAULT_RUNTIME_CONFIG,
+            tokenizer=object(),
+            source="separate",
+            sequence_length=2,
+            batch_size=1,
+            eval_batches=1,
+        )
 
-    assert runtime_data.metadata["mode"] == "separate"
     assert selected == ["eurlex", "ledgar", "scotus"]
 
 
@@ -575,11 +587,19 @@ def test_compressibility_unreliable_when_reference_not_better_than_base(
     (tmp_path / "cfg.yaml").write_text("adapter:\n  rank: 16\n", encoding="utf-8")
     _write_json(
         tmp_path / "r4.json",
-        {"domains": ["d1", "d2"], "base_loss": [3.0, 3.0], "loss": [[2.5, 2.5]]},
+        {
+            "domains": ["d1", "d2"],
+            "base_loss": [3.0, 3.0],
+            "loss": [[2.5, 2.5], [2.5, 2.5]],
+        },
     )
     _write_json(
         tmp_path / "r16.json",
-        {"domains": ["d1", "d2"], "base_loss": [3.0, 3.0], "loss": [[2.5, 3.5]]},
+        {
+            "domains": ["d1", "d2"],
+            "base_loss": [3.0, 3.0],
+            "loss": [[2.5, 3.5], [3.0, 3.5]],
+        },
     )
     ev = evaluate_manifest(tmp_path)
     rec = next(r for r in ev["records"] if r["rank"] == 4)

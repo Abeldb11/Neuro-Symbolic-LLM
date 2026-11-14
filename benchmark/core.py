@@ -1188,7 +1188,6 @@ def _filter_adapter_params(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compressibility_curve(deltas: dict[int, float]) -> dict[int, float]:
-
     return _compressibility_detail(deltas)["curve"] or {}
 
 
@@ -2099,7 +2098,7 @@ def evaluate_manifest(output_dir: Path) -> dict[str, Any]:
 def _numeric_values(value: Any) -> list[float]:
     if isinstance(value, bool):
         return []
-    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+    if isinstance(value, int | float) and math.isfinite(float(value)):
         return [float(value)]
     if isinstance(value, dict):
         values: list[float] = []

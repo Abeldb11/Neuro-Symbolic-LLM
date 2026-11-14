@@ -70,7 +70,6 @@ def test_multilabel_hit_metrics() -> None:
 
 
 def test_backward_transfer_sign_convention() -> None:
-
     acc = [[0.8, 0.0, 0.0], [0.6, 0.9, 0.0], [0.5, 0.7, 0.9]]
     # j<2: (0.5-0.8) and (0.7-0.9) -> mean -0.25 (forgetting)
     assert backward_transfer(acc, 2) == pytest.approx(-0.25)
@@ -84,7 +83,6 @@ def test_backward_transfer_sign_convention() -> None:
 
 
 def test_heldout_transfer() -> None:
-
     base = [3.0, 3.0, 3.0]
     loss = [[2.0, 2.8, 2.9], [2.1, 2.0, 2.5], [2.2, 2.1, 2.0]]
     out = heldout_transfer(loss, base, ["a", "b", "c"])
@@ -105,7 +103,6 @@ def test_heldout_transfer() -> None:
 
 
 def test_sequential_joint_gap_signs_and_guard() -> None:
-
     out = sequential_joint_gap([2.5, 2.2], [2.0, 2.2], base=[3.0, 2.21])
     assert out["gap"] == pytest.approx([0.5, 0.0])  # positive = sequential worse
     assert out["mean_gap"] == pytest.approx(0.25)
@@ -118,7 +115,6 @@ def test_sequential_joint_gap_signs_and_guard() -> None:
 
 
 def test_anchor_drift() -> None:
-
     out = anchor_drift([0.0, 0.1, 0.05], [3.0, 3.2, 3.1], base_loss=3.0)
     assert out["final_kl"] == pytest.approx(0.05)
     assert out["peak_kl"] == pytest.approx(0.1)
