@@ -10,6 +10,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 os.environ.setdefault("GLOG_minloglevel", "3")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -26,6 +27,11 @@ import numpy as np  # noqa: E402
 import optax  # noqa: E402
 
 from frozenllm.substrate import FrozenSubstrate  # noqa: E402
+from metrics.performance import (  # noqa: E402
+    calibration_stats,
+    ece_from_stats,
+    token_accuracy,
+)
 from residual import ResidualAdapter  # noqa: E402
 from runtime.data_loader import load_runtime_data  # noqa: E402
 from stages.results import (  # noqa: E402
@@ -37,9 +43,12 @@ from stages.stage_A.a3 import A3HybridConfig, A3Model  # noqa: E402
 from stages.stage_base import (  # noqa: E402
     RunConfig,
     apply_run_overrides,
+    attach_task_probes,
     configure_logging,
+    evaluate_task,
     format_params,
     load_configs,
+    load_task_examples,
     log_experiment_header,
     log_final_summary,
     make_eval_set,
@@ -170,6 +179,8 @@ def evaluate_deployment(
             "loss": 0.0,
             "ppl": 1.0,
             "kl": 0.0,
+            "token_accuracy": 0.0,
+            "ece": 0.0,
         }
 
     def evaluate_step(p, ids):
@@ -194,15 +205,25 @@ def evaluate_deployment(
             base_logits=base,
         )
 
-        return base_loss, loss, kl
+        conf_sum, acc_sum, counts = calibration_stats(adapted, ids)
+        return (
+            base_loss,
+            loss,
+            kl,
+            token_accuracy(adapted, ids),
+            conf_sum,
+            acc_sum,
+            counts,
+        )
 
     step = jax.jit(evaluate_step) if jit else evaluate_step
 
-    rows = [tuple(float(v) for v in step(params, ids)) for ids in eval_batches]
-
-    base_loss, loss, kl = (
-        float(np.mean(column)) for column in zip(*rows, strict=False)
+    results = [step(params, ids) for ids in eval_batches]
+    base_loss, loss, kl, accuracy = (
+        float(np.mean([float(r[i]) for r in results])) for i in range(4)
     )
+    # Token ECE pooled over every batch, identical to stage_base.evaluate (A1/A2).
+    pooled = tuple(sum(r[i] for r in results) for i in (4, 5, 6))
 
     return {
         "base_loss": base_loss,
@@ -210,7 +231,31 @@ def evaluate_deployment(
         "loss": loss,
         "ppl": float(np.exp(loss)),
         "kl": kl,
+        "token_accuracy": accuracy,
+        "ece": float(ece_from_stats(*pooled)),
     }
+
+
+def evaluate_task_deployment(
+    substrate: FrozenSubstrate,
+    model: A3Model,
+    params: Any,
+    domain: Any,
+) -> dict[str, Any]:
+    """Label-token task probe through A3's two-pass deployment (shared stage_base probe)."""
+    task_examples = getattr(domain, "task_examples", ())
+    label_token_ids = getattr(domain, "label_token_ids", ())
+    if not task_examples or not label_token_ids:
+        reason = getattr(domain, "task_skip_reason", None)
+        return {"task_skip_reason": reason} if reason else {}
+    return evaluate_task(
+        substrate,
+        None,
+        params,
+        task_examples,
+        label_token_ids,
+        logits_fn=lambda p, ids: model.deploy_logits(p, ids)[0],
+    )
 
 
 # ---------------------------------------------------------------------
@@ -286,14 +331,21 @@ def run_one(
     # Evaluation callback
     # -------------------------------------------------------------
 
+    task_by_eval_set = {id(task.eval_set): task for task in domains}
+    task_by_name = {task.name: task for task in domains}
+
     def eval_fn(p, eval_set):
-        return evaluate_deployment(
+        result = evaluate_deployment(
             substrate,
             model,
             p,
             eval_set,
             jit=train_cfg.jit,
         )
+        task = task_by_eval_set.get(id(eval_set))
+        if task is not None:
+            result.update(evaluate_task_deployment(substrate, model, p, task))
+        return result
 
     # -------------------------------------------------------------
     # A3-specific PC energy curve callback
@@ -431,6 +483,9 @@ def run_one(
                 params,
                 test_set,
             )
+            task = task_by_name.get(name)
+            if task is not None and "task_accuracy" not in result:
+                result.update(evaluate_task_deployment(substrate, model, params, task))
 
             test_results[name] = result
 
@@ -523,6 +578,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size=train_cfg.batch_size,
         eval_batches=eval_batches,
         default_epochs=train_cfg.epochs,
+    )
+
+    domain_cfgs = {d.name: d for d in cfg.domains}
+    if domain_cfgs:
+        updated_tasks = []
+        for task in runtime_data.tasks:
+            d_cfg = domain_cfgs.get(task.name)
+            if d_cfg is not None:
+                task_examples, label_token_ids = load_task_examples(
+                    substrate, d_cfg, d_cfg.eval_split, train_cfg.seq_len
+                )
+                skip_reason = None
+                if not task_examples:
+                    skip_reason = f"label field '{d_cfg.label_field}' not in dataset or no labeled examples"
+                updated_tasks.append(
+                    replace(
+                        task,
+                        task_examples=task_examples,
+                        label_token_ids=label_token_ids,
+                        task_skip_reason=skip_reason,
+                    )
+                )
+            else:
+                updated_tasks.append(task)
+        runtime_data = replace(runtime_data, tasks=tuple(updated_tasks))
+
+    # Tasks without stage-config examples get validation probes from their pinned legal_task
+    # spec, so A1, A2 and A3 report the same task metrics at every checkpoint.
+    runtime_data = attach_task_probes(
+        runtime_data,
+        substrate.tokenizer,
+        args.runtime_config,
+        seq_len=train_cfg.seq_len,
     )
 
     domains = runtime_data.tasks

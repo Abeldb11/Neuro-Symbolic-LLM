@@ -50,6 +50,7 @@ from stages.stage_A.a2.a2_reporting import internal_metrics  # noqa: E402
 from stages.stage_base import (  # noqa: E402
     RunConfig,
     apply_run_overrides,
+    attach_task_probes,
     configure_logging,
     evaluate,
     format_params,
@@ -57,6 +58,7 @@ from stages.stage_base import (  # noqa: E402
     load_configs,
     log_experiment_header,
     log_final_summary,
+    make_eval_fn,
 )
 from training.train import train  # noqa: E402
 
@@ -317,6 +319,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         default_epochs=train_cfg.epochs,
     )
 
+    # Validation-split label-token probes: task accuracy / F1 / ECE at every checkpoint, with
+    # the same shared code as A1 and A3.
+    runtime_data = attach_task_probes(
+        runtime_data,
+        substrate.tokenizer,
+        args.runtime_config,
+        seq_len=train_cfg.seq_len,
+    )
     domains = runtime_data.tasks
     training_tasks = runtime_data.training_tasks or domains
 
@@ -567,7 +577,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             optimizer=optimizer,
             config=train_cfg,
             writer=writer,
-            eval_fn=evaluate_a2,
+            eval_fn=make_eval_fn(
+                substrate,
+                adapter,
+                domains,
+                jit=train_cfg.jit,
+                params_fn=adapter_params,
+            ),
             evaluation_tasks=domains,
         )
 

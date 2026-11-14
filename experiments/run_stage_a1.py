@@ -44,12 +44,14 @@ from stages.stage_A.a1 import (  # noqa: E402
 from stages.stage_base import (  # noqa: E402
     RunConfig,
     apply_run_overrides,
+    attach_task_probes,
     configure_logging,
     evaluate,
     initialize_stage,
     load_configs,
     log_experiment_header,
     log_final_summary,
+    make_eval_fn,
 )
 from training.train import train  # noqa: E402
 
@@ -173,6 +175,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(results, indent=2))
         return 0
 
+    # Validation-split label-token probes, so task accuracy / F1 / ECE are tracked at every
+    # checkpoint exactly as in A2 and A3 (shared metric code in metrics/performance.py).
+    runtime_data = attach_task_probes(
+        runtime_data,
+        substrate.tokenizer,
+        args.runtime_config,
+        seq_len=train_cfg.seq_len,
+    )
     domains = runtime_data.tasks
     training_tasks = runtime_data.training_tasks or domains
 
@@ -232,10 +242,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             optimizer=optimizer,
             config=train_cfg,
             writer=writer,
-            eval_fn=partial(
-                evaluate,
+            eval_fn=make_eval_fn(
                 substrate,
                 adapter,
+                domains,
                 jit=train_cfg.jit,
             ),
             evaluation_tasks=domains,

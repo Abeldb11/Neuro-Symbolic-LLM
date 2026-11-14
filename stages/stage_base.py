@@ -32,9 +32,19 @@ except (ImportError, RuntimeError):
 from frozenllm.substrate import FrozenSubstrate, identity_modify
 from losses.shared import model_loss_terms
 from metrics.performance import (
+    accuracy_forgetting,
+    backward_transfer,
+    calibration_from_predictions,
+    calibration_stats,
+    classification_metrics,
+    classification_scores,
+    ece_from_stats,
+    heldout_transfer,
     mean_forgetting,
-    mean_seen_loss,
+    mean_seen_accuracy,
+    multilabel_hit_metrics,
     perplexity,
+    token_accuracy,
     training_step_time,
 )
 from metrics.representation import loss_improvement
@@ -122,6 +132,8 @@ class DomainConfig:
     # Joins rows into one stream; use "\n\n" for one-document-per-row datasets.
     separator: str = ""
     epochs: int | None = None
+    label_field: str = "label"
+    label_tokens: tuple[str, ...] | list[str] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not DOMAIN_NAME.match(self.name):
@@ -234,6 +246,9 @@ class Domain:
     train_blocks: np.ndarray
     eval_set: tuple[jax.Array, ...]
     epochs: int
+    task_examples: tuple[tuple[jax.Array, Any, int], ...] = ()
+    label_token_ids: tuple[tuple[int, ...], ...] = ()
+    task_skip_reason: str | None = None
 
 
 def load_token_blocks(
@@ -262,6 +277,82 @@ def load_token_blocks(
     # Annotated: numpy is opaque to mypy (follow_imports = "skip").
     blocks: np.ndarray = np.asarray(ids[: n * seq_len], dtype=np.int32)
     return blocks.reshape(n, seq_len)
+
+
+def load_task_examples(
+    substrate: FrozenSubstrate,
+    domain: DomainConfig,
+    split: str,
+    seq_len: int,
+) -> tuple[tuple[tuple[jax.Array, Any, int], ...], tuple[tuple[int, ...], ...]]:
+    if load_dataset is None or substrate.tokenizer is None:
+        return (), ()
+    try:
+        raw_ds = load_dataset(
+            domain.dataset, domain.dataset_config, split=split, trust_remote_code=True
+        )
+    except TypeError:
+        raw_ds = load_dataset(domain.dataset, domain.dataset_config, split=split)
+    if domain.label_field not in raw_ds.column_names:
+        return (), ()
+    labels = list(raw_ds[domain.label_field])
+    multilabel = bool(labels) and isinstance(labels[0], list | tuple)
+    if multilabel:
+        # Multi-label (e.g. EUR-Lex): the class set is every label seen; each example
+        # carries the tuple of its gold class indices.
+        unique_labels = sorted({int(x) for gold in labels for x in gold})
+    else:
+        unique_labels = list(dict.fromkeys(labels))
+    verbalizers = (
+        [str(label) for label in unique_labels]
+        if domain.label_tokens is None
+        else list(domain.label_tokens)
+    )
+    if len(verbalizers) != len(unique_labels):
+        raise ValueError(
+            f"{domain.name}: label_tokens must have one entry per class "
+            f"({len(unique_labels)}), got {len(verbalizers)}"
+        )
+    label_token_ids = []
+    for verbalizer in verbalizers:
+        ids = substrate.tokenizer.encode(
+            f" {verbalizer}", add_special_tokens=False
+        )
+        if not ids:
+            raise ValueError(f"{domain.name}: label token {verbalizer!r} is empty")
+        label_token_ids.append(tuple(int(token_id) for token_id in ids))
+    label_index = {label: index for index, label in enumerate(unique_labels)}
+    pad_id = (
+        substrate.tokenizer.pad_token_id
+        if substrate.tokenizer.pad_token_id is not None
+        else substrate.tokenizer.eos_token_id
+    )
+    if pad_id is None:
+        raise ValueError(f"{domain.name}: tokenizer needs a pad or EOS token")
+    examples = []
+    for row, label in zip(raw_ds, labels, strict=True):
+        text = row.get(domain.text_field)
+        if not isinstance(text, str):
+            text = next(
+                (value for value in row.values() if isinstance(value, str) and value),
+                "",
+            )
+        ids = substrate.tokenizer.encode(
+            text, add_special_tokens=False, truncation=True, max_length=seq_len
+        )
+        if not ids:
+            continue
+        position = len(ids) - 1
+        padded = ids + [pad_id] * (seq_len - len(ids))
+        target: int | tuple[int, ...] = (
+            tuple(sorted(label_index[int(x)] for x in label))
+            if multilabel
+            else label_index[label]
+        )
+        if multilabel and not target:
+            continue
+        examples.append((jnp.asarray(padded, dtype=jnp.int32), target, position))
+    return tuple(examples), tuple(label_token_ids)
 
 
 def make_eval_set(
@@ -330,11 +421,22 @@ def prepare_domain(
     validation = load_token_blocks(
         substrate, domain, domain.eval_split, training.seq_len
     )
+    task_examples, label_token_ids = load_task_examples(
+        substrate, domain, domain.eval_split, training.seq_len
+    )
+    skip_reason = None
+    if not task_examples:
+        skip_reason = (
+            f"label field '{domain.label_field}' not in dataset or no labeled examples"
+        )
     return Domain(
         name=domain.name,
         train_blocks=train,
         eval_set=make_eval_set(validation, training.batch_size, training.eval_batches),
         epochs=training.epochs if domain.epochs is None else domain.epochs,
+        task_examples=task_examples,
+        label_token_ids=label_token_ids,
+        task_skip_reason=skip_reason,
     )
 
 
@@ -381,6 +483,11 @@ def evaluate(
     *,
     jit: bool = True,
 ) -> dict[str, float]:
+    """Per-checkpoint external language-model metrics (``metrics.performance``).
+
+    Returns base/adapted loss and perplexity, KL to the frozen model, token accuracy
+    (a diagnostic, not task accuracy) and token-level ECE pooled over all batches.
+    """
     if not eval_batches:
         return {
             "base_loss": 0.0,
@@ -388,11 +495,11 @@ def evaluate(
             "loss": 0.0,
             "ppl": 1.0,
             "kl": 0.0,
+            "token_accuracy": 0.0,
+            "ece": 0.0,
         }
 
-    def _eval_step(
-        p: AdapterParams, ids: jax.Array
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    def _eval_step(p: AdapterParams, ids: jax.Array) -> tuple[Any, ...]:
         base = base_logits(substrate, ids)
         adapted = substrate.run_with_interception(
             ids, modify_fn=adapter.modify_fn(p), intercept_layers=adapter.layers
@@ -400,16 +507,21 @@ def evaluate(
         base_loss = substrate.compute_loss(base, ids, losses=("CE",))
         loss = substrate.compute_loss(adapted, ids, losses=("CE",))
         kl = substrate.compute_loss(adapted, ids, losses=("KL",), base_logits=base)
-        return base_loss, loss, kl
+        conf_sum, acc_sum, counts = calibration_stats(adapted, ids)
+        return base_loss, loss, kl, token_accuracy(adapted, ids), conf_sum, acc_sum, counts
 
     eval_step = jax.jit(_eval_step) if jit else _eval_step
 
-    base_losses, losses, kls = [], [], []
+    base_losses, losses, kls, accs = [], [], [], []
+    pooled = None
     for ids in eval_batches:
-        b_loss, a_loss, kl = eval_step(params, ids)
+        b_loss, a_loss, kl, acc, conf_sum, acc_sum, counts = eval_step(params, ids)
         base_losses.append(float(b_loss))
         losses.append(float(a_loss))
         kls.append(float(kl))
+        accs.append(float(acc))
+        stats = (conf_sum, acc_sum, counts)
+        pooled = stats if pooled is None else tuple(a + b for a, b in zip(pooled, stats))
     base_loss, loss = float(np.mean(base_losses)), float(np.mean(losses))
     return {
         "base_loss": base_loss,
@@ -417,7 +529,79 @@ def evaluate(
         "loss": loss,
         "ppl": float(perplexity(loss)),
         "kl": float(np.mean(kls)),
+        "token_accuracy": float(np.mean(accs)),
+        # Pooled over all eval batches so bins are not averaged batch-by-batch.
+        "ece": float(ece_from_stats(*pooled)) if pooled is not None else 0.0,
     }
+
+
+def evaluate_task(
+    substrate: FrozenSubstrate,
+    adapter: ResidualAdapter,
+    params: AdapterParams,
+    examples: Sequence[tuple[jax.Array, Any, int]],
+    label_token_ids: Sequence[Sequence[int]],
+    *,
+    logits_fn: Any | None = None,
+) -> dict[str, float]:
+    """Label-token classification probe: accuracy, F1 and task-level calibration.
+
+    Single-label tasks report accuracy, macro-F1, micro-F1 (equal to accuracy) and task
+    ECE. Multi-label tasks (targets are tuples of class indices) report ``task_accuracy`` =
+    hit@1, ``task_f1`` = micro-F1 and the micro precision/recall of the one-label-per-example
+    prediction. ``logits_fn(params, ids)`` overrides the deployed forward pass (A3's
+    two-pass deployment, A2's parameter mapping); the default is the adapter path.
+    """
+    if not examples or not label_token_ids:
+        return {}
+    width = max(len(item) for item in label_token_ids)
+    token_matrix = jnp.asarray(
+        [list(item) + [item[-1]] * (width - len(item)) for item in label_token_ids],
+        dtype=jnp.int32,
+    )
+    preds, confs = [], []
+    for start in range(0, len(examples), 32):
+        batch = examples[start : start + 32]
+        ids = jnp.stack([example[0] for example in batch])
+        positions = jnp.asarray([example[2] for example in batch], dtype=jnp.int32)
+        if logits_fn is not None:
+            logits = logits_fn(params, ids)
+        else:
+            logits = substrate.run_with_interception(
+                ids,
+                modify_fn=adapter.modify_fn(params),
+                intercept_layers=adapter.layers,
+            ).logits
+        pred, conf = classification_scores(logits, positions, token_matrix)
+        preds.append(np.asarray(pred))
+        confs.append(np.asarray(conf))
+    predictions = np.concatenate(preds)
+    confidence = np.concatenate(confs)
+    raw_targets = [example[1] for example in examples]
+    if isinstance(raw_targets[0], tuple):
+        metrics = multilabel_hit_metrics(raw_targets, predictions, len(label_token_ids))
+        correct = np.array([int(p in g) for g, p in zip(raw_targets, predictions)])
+        out = {
+            "task_accuracy": metrics["hit_at_1"],
+            "task_f1": metrics["micro_f1"],
+            "task_micro_f1": metrics["micro_f1"],
+            "task_micro_precision": metrics["micro_precision"],
+            "task_micro_recall": metrics["micro_recall"],
+        }
+    else:
+        targets = np.asarray(raw_targets, dtype=np.int32)
+        metrics = classification_metrics(targets, predictions)
+        correct = (predictions == targets).astype(int)
+        out = {
+            "task_accuracy": metrics["accuracy"],
+            "task_f1": metrics["macro_f1"],
+            "task_micro_f1": metrics["accuracy"],  # single-label: micro-F1 == accuracy
+        }
+    calibration = calibration_from_predictions(confidence, correct)
+    if calibration["ece"] is not None:
+        out["task_ece"] = float(calibration["ece"])
+        out["task_mean_confidence"] = float(calibration["mean_confidence"])
+    return out
 
 
 def resolve_split(domain: DomainConfig, split: str) -> str:
@@ -474,8 +658,64 @@ def summarize(
     rows: Sequence[Mapping[str, Mapping[str, float]]],
 ) -> dict[str, Any]:
     loss = np.array([[row[n]["loss"] for n in names] for row in rows])
+    task_accuracy = np.array(
+        [[row[n].get("task_accuracy", np.nan) for n in names] for row in rows]
+    )
+    task_f1 = np.array(
+        [[row[n].get("task_f1", np.nan) for n in names] for row in rows]
+    )
     base_loss = [init[n]["base_loss"] for n in names]
     num_tasks = len(rows)
+    has_task_metrics = bool(np.isfinite(task_accuracy).any())
+    accuracy_forgetting_values: list[float | None] | None = None
+    if has_task_metrics:
+        accuracy_forgetting_values = [None]
+        for t in range(1, num_tasks):
+            val = float(accuracy_forgetting(task_accuracy, t))
+            accuracy_forgetting_values.append(
+                val if math.isfinite(val) else None
+            )
+
+    skipped: dict[str, str] = {}
+    for j, n in enumerate(names):
+        col = task_accuracy[:, j]
+        if not np.isfinite(col).all():
+            reason = next(
+                (
+                    str(row[n][k])
+                    for row in rows
+                    if n in row
+                    for k in ("task_skip_reason", "skip_reason", "reason", "skipped")
+                    if k in row[n] and row[n][k]
+                ),
+                None,
+            )
+            if reason is None:
+                if not np.isfinite(col).any():
+                    reason = f"label field not configured or missing for domain '{n}'"
+                else:
+                    reason = f"incomplete task accuracy metrics for domain '{n}' across checkpoints"
+            skipped[n] = reason
+
+    def _matrix(key: str) -> np.ndarray:
+        return np.array([[row[n].get(key, np.nan) for n in names] for row in rows])
+
+    def _or_none(matrix: np.ndarray) -> list[list[float]] | None:
+        return matrix.tolist() if np.isfinite(matrix).any() else None
+
+    token_acc, token_ece = _matrix("token_accuracy"), _matrix("ece")
+    task_micro_f1, task_ece = _matrix("task_micro_f1"), _matrix("task_ece")
+    # Backward / held-out transfer need one checkpoint per domain (square A[t, j]).
+    square = num_tasks == len(names) and num_tasks >= 2
+
+    def _bwt(matrix: np.ndarray, *, higher: bool) -> list[float | None] | None:
+        if not square or not np.isfinite(matrix).any():
+            return None
+        values = [None]
+        for t in range(1, num_tasks):
+            v = float(backward_transfer(matrix, t, higher_is_better=higher))
+            values.append(v if math.isfinite(v) else None)
+        return values
 
     return {
         "domains": list(names),
@@ -490,11 +730,175 @@ def summarize(
             ]
             for t in range(num_tasks)
         ],
-        "mean_seen_loss": [float(mean_seen_loss(loss, t)) for t in range(num_tasks)],
+        "mean_seen_loss": [
+            float(mean_seen_accuracy(loss, t)) for t in range(num_tasks)
+        ],
         # Undefined at t=0 (no earlier task), stored as null.
         "mean_forgetting": [None]
-        + [float(mean_forgetting(loss, t)) for t in range(1, num_tasks)],
+        + [
+            float(mean_forgetting(loss, t, higher_is_better=False))
+            for t in range(1, num_tasks)
+        ],
+        "task_accuracy": task_accuracy.tolist() if has_task_metrics else None,
+        "task_f1": task_f1.tolist() if np.isfinite(task_f1).any() else None,
+        "accuracy_forgetting": accuracy_forgetting_values,
+        "token_accuracy": _or_none(token_acc),
+        "ece": _or_none(token_ece),
+        "task_micro_f1": _or_none(task_micro_f1),
+        "task_ece": _or_none(task_ece),
+        "backward_transfer_loss": _bwt(loss, higher=False),
+        "backward_transfer_accuracy": _bwt(task_accuracy, higher=True),
+        "heldout_transfer": (
+            heldout_transfer(loss, base_loss, list(names)) if square else None
+        ),
+        "skipped": skipped,
+        "task_skipped": skipped,
     }
+
+
+# ---------------------------------------------------------------------
+# Shared per-checkpoint task probe (A1, A2 and A3 evaluate identically)
+# ---------------------------------------------------------------------
+
+PROBE_SETTINGS = Path(__file__).resolve().parents[1] / "configs" / "benchmark_eval.yaml"
+
+
+def load_probe_settings() -> dict[str, Any]:
+    """``probe`` section of configs/benchmark_eval.yaml (``BENCHMARK_EVAL_CONFIG`` overrides)."""
+    path = Path(os.environ.get("BENCHMARK_EVAL_CONFIG", str(PROBE_SETTINGS)))
+    if not path.is_file():
+        return {}
+    return (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("probe") or {}
+
+
+def probe_examples_from_split(
+    split: Any, tokenizer: Any
+) -> tuple[tuple[tuple[jax.Array, Any, int], ...], tuple[tuple[int, ...], ...]]:
+    """Label-token probe examples from a pinned ``runtime.data_loader.LabeledSplit``.
+
+    Returns ``(examples, label_token_ids)`` in the format ``evaluate_task`` expects:
+    ``(padded_ids, target, last_position)`` where ``target`` is a class index, or a tuple of
+    class indices for multi-label tasks. Verbalizers are the label names.
+    """
+    token_ids: list[tuple[int, ...]] = []
+    for name in split.label_names:
+        encoded = tokenizer.encode(f" {name}", add_special_tokens=False)
+        if not encoded:
+            raise ValueError(f"empty verbalizer for label {name!r}")
+        token_ids.append(tuple(int(t) for t in encoded))
+    positions = np.asarray(split.attention_mask).sum(axis=1) - 1
+    targets: list[Any] = (
+        [tuple(int(i) for i in np.flatnonzero(row)) for row in split.targets]
+        if split.multilabel
+        else [int(i) for i in split.probe_targets()]
+    )
+    ids = np.asarray(split.input_ids, dtype=np.int32)
+    examples = tuple(
+        (jnp.asarray(ids[i]), targets[i], int(positions[i]))
+        for i in range(len(ids))
+        if positions[i] >= 0 and targets[i] != ()
+    )
+    return examples, tuple(token_ids)
+
+
+def attach_task_probes(
+    runtime_data: Any,
+    tokenizer: Any,
+    runtime_config_path: str | Path,
+    *,
+    seq_len: int,
+) -> Any:
+    """Give each runtime task validation-split probe examples from its ``legal_task`` spec.
+
+    Per-checkpoint probes use the **validation** split; the benchmark's final, post-hoc
+    evaluation uses the test split. Tasks without a spec (for example stories) and tasks
+    that already have examples are left alone. Failures become ``task_skip_reason``.
+    """
+    from dataclasses import replace
+
+    from runtime.data_loader import legal_task_specs, load_labeled_split, load_runtime_config
+
+    settings = load_probe_settings()
+    if settings.get("enabled", True) is False:
+        return runtime_data
+    max_examples = int(settings.get("stage_max_examples", settings.get("max_examples", 200)))
+    specs = {
+        spec.name: spec
+        for spec in legal_task_specs(load_runtime_config(runtime_config_path))
+    }
+    updated = []
+    for task in runtime_data.tasks:
+        spec = specs.get(task.name)
+        if spec is None or task.task_examples:
+            updated.append(task)
+            continue
+        try:
+            split = load_labeled_split(
+                spec,
+                "validation",
+                tokenizer,
+                sequence_length=seq_len,
+                max_examples=max_examples,
+            )
+            examples, token_ids = probe_examples_from_split(split, tokenizer)
+            reason = None if examples else f"{task.name}: no labelled validation examples"
+        except Exception as exc:  # dataset problems must not abort training
+            examples, token_ids = (), ()
+            reason = f"{task.name}: {type(exc).__name__}: {exc}"[:300]
+        updated.append(
+            replace(
+                task,
+                task_examples=examples,
+                label_token_ids=token_ids,
+                task_skip_reason=reason,
+            )
+        )
+    return replace(runtime_data, tasks=tuple(updated))
+
+
+def make_eval_fn(
+    substrate: FrozenSubstrate,
+    adapter: ResidualAdapter,
+    tasks: Sequence[Any],
+    *,
+    jit: bool = True,
+    params_fn: Any | None = None,
+    logits_fn: Any | None = None,
+    evaluate_fn: Any | None = None,
+) -> Any:
+    """Checkpoint evaluation callback shared by A1, A2 and A3.
+
+    ``eval_fn(params, eval_set)`` returns ``evaluate``'s language-model metrics plus, for the
+    task whose validation set this is, the label-token probe metrics. ``params_fn`` maps the
+    trainer's parameters to adapter parameters (A2); ``logits_fn`` and ``evaluate_fn`` replace the
+    forward pass and the LM evaluation (A3 two-pass deployment).
+    """
+    by_eval_set = {id(task.eval_set): task for task in tasks}
+
+    def eval_fn(params: Any, eval_set: Sequence[jax.Array]) -> dict[str, Any]:
+        adapter_params = params if params_fn is None else params_fn(params)
+        if evaluate_fn is not None:
+            result = evaluate_fn(params, eval_set)
+        else:
+            result = evaluate(substrate, adapter, adapter_params, eval_set, jit=jit)
+        task = by_eval_set.get(id(eval_set))
+        if task is not None:
+            if task.task_examples and task.label_token_ids:
+                result.update(
+                    evaluate_task(
+                        substrate,
+                        adapter,
+                        params if logits_fn is not None else adapter_params,
+                        task.task_examples,
+                        task.label_token_ids,
+                        logits_fn=logits_fn,
+                    )
+                )
+            elif task.task_skip_reason:
+                result["task_skip_reason"] = task.task_skip_reason
+        return result
+
+    return eval_fn
 
 
 def run_sequential(
@@ -519,6 +923,16 @@ def run_sequential(
             row[d.name] = evaluate(
                 substrate, adapter, params, d.eval_set, jit=training.jit
             )
+            task_metrics = evaluate_task(
+                substrate,
+                adapter,
+                params,
+                d.task_examples,
+                d.label_token_ids,
+            )
+            row[d.name].update(task_metrics)
+            if not task_metrics and d.task_skip_reason:
+                row[d.name]["task_skip_reason"] = d.task_skip_reason
             writer.log("eval", after_task=after_task, domain=d.name, **row[d.name])
         if after_task < 0:
             log.info(
