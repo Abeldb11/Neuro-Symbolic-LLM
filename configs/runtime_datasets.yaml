@@ -75,6 +75,13 @@ datasets:
     test_split: "test[:500]"
     text_field: text
     separator: "\n\n"
+    legal_task:
+      label_field: labels
+      multilabel: true
+      expected_num_labels: 100
+      train_split: train
+      validation_split: validation
+      test_split: test
 
   - name: ledgar
     type: separate
@@ -86,6 +93,13 @@ datasets:
     test_split: "test[:2000]"
     text_field: text
     separator: "\n\n"
+    legal_task:
+      label_field: label
+      multilabel: false
+      expected_num_labels: 100
+      train_split: train
+      validation_split: validation
+      test_split: test
 
   - name: scotus
     type: separate
@@ -97,6 +111,13 @@ datasets:
     test_split: "test[:200]"
     text_field: text
     separator: "\n\n"
+    legal_task:
+      label_field: label
+      multilabel: false
+      expected_num_labels: 13
+      train_split: train
+      validation_split: validation
+      test_split: test
   - name: rocstories
     type: stories
     dataset: hamishivi/ROCStories

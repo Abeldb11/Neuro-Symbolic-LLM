@@ -48,11 +48,10 @@ UNAVAILABLE_INTERNAL_METRIC_SPECS = (
     ("Naturality proxy", "naturality_unavailable", "context"),
     ("Ablation fidelity proxy", "ablation_fidelity_unavailable", "higher"),
 )
-UNAVAILABLE_EXTERNAL_METRIC_SPECS = (
-    ("Task primary score", "task_primary_unavailable", "higher"),
-    ("Task macro-F1", "task_macro_f1_unavailable", "higher"),
-    ("Accuracy forgetting", "accuracy_forgetting_unavailable", "lower"),
-)
+# Task accuracy, macro-F1 and accuracy forgetting are now measured by the label-token
+# probe (``ext_task_accuracy``, ``ext_task_f1``, ``ext_bwt_accuracy`` in
+# ``EXTERNAL_METRIC_SPECS``); nothing external is hard-coded as unavailable any more.
+UNAVAILABLE_EXTERNAL_METRIC_SPECS: tuple[tuple[str, str, str], ...] = ()
 VISUALIZATION_OPERATIONAL_METRIC_SPECS = OPERATIONAL_METRIC_SPECS + (
     ("Mean training step time (seconds)", "mean_step_time", "lower"),
 )
@@ -64,9 +63,6 @@ UNAVAILABLE_REASONS = {
     "causal_fingerprint_unavailable": "independent component-role labels are unavailable",
     "naturality_unavailable": "category labels and declared transformations are unavailable",
     "ablation_fidelity_unavailable": "the sampled intervention audit protocol is not enabled",
-    "task_primary_unavailable": "the current benchmark does not use labeled task targets",
-    "task_macro_f1_unavailable": "the current benchmark does not use labeled task targets",
-    "accuracy_forgetting_unavailable": "task-score matrices are unavailable without labeled targets",
 }
 
 

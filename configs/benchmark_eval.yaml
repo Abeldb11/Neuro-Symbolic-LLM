@@ -1,12 +1,17 @@
-# Settings for the external-metric layer in benchmark/core.py (checkpoint-matrix evaluation).
+# Settings for the external-metric layer. Read by stages/stage_base.py (per-checkpoint probe
+# during training, validation split) and benchmark/core.py (post-hoc evaluation, test split).
+# Internal-metric settings are not here: they live in the `evaluation:` section of
+# configs/runtime_datasets.yaml, which benchmark/core.py passes to metrics/representation.py.
 # Every section is optional: a missing or unloadable section is reported as "unavailable"
 # with the reason, never as zero. Labels and pinned dataset revisions for the task probe come
 # from the `legal_task` blocks in configs/runtime_datasets.yaml; nothing is duplicated here.
 # Override the path with the BENCHMARK_EVAL_CONFIG environment variable.
 
 probe:                       # label-token classification probe (task accuracy / F1 / class ECE)
-  enabled: true
-  max_examples: 500          # per task, first N of the test split
+  enabled: true              # false: skip the probe everywhere (stage runners and benchmark)
+  stage_max_examples: 200    # per task, validation split, evaluated at every checkpoint while training
+                             # (stages/stage_base.attach_task_probes; same code in A1, A2 and A3)
+  max_examples: 500          # per task, test split, final post-hoc evaluation (benchmark/core.py)
 
 anchor:                      # fixed general-text corpus; drift from the frozen model per checkpoint
   dataset: wikitext

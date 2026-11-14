@@ -48,7 +48,6 @@ from stages.stage_base import (  # noqa: E402
     evaluate_task,
     format_params,
     load_configs,
-    load_task_examples,
     log_experiment_header,
     log_final_summary,
     make_eval_set,
@@ -483,6 +482,7 @@ def run_one(
                 params,
                 test_set,
             )
+
             task = task_by_name.get(name)
             if task is not None and "task_accuracy" not in result:
                 result.update(evaluate_task_deployment(substrate, model, params, task))
@@ -580,32 +580,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         default_epochs=train_cfg.epochs,
     )
 
-    domain_cfgs = {d.name: d for d in cfg.domains}
-    if domain_cfgs:
-        updated_tasks = []
-        for task in runtime_data.tasks:
-            d_cfg = domain_cfgs.get(task.name)
-            if d_cfg is not None:
-                task_examples, label_token_ids = load_task_examples(
-                    substrate, d_cfg, d_cfg.eval_split, train_cfg.seq_len
-                )
-                skip_reason = None
-                if not task_examples:
-                    skip_reason = f"label field '{d_cfg.label_field}' not in dataset or no labeled examples"
-                updated_tasks.append(
-                    replace(
-                        task,
-                        task_examples=task_examples,
-                        label_token_ids=label_token_ids,
-                        task_skip_reason=skip_reason,
-                    )
-                )
-            else:
-                updated_tasks.append(task)
-        runtime_data = replace(runtime_data, tasks=tuple(updated_tasks))
-
-    # Tasks without stage-config examples get validation probes from their pinned legal_task
-    # spec, so A1, A2 and A3 report the same task metrics at every checkpoint.
+    # Validation probes from the pinned ``legal_task`` specs, so A1, A2 and A3 report
+    # the same task metrics at every checkpoint.
     runtime_data = attach_task_probes(
         runtime_data,
         substrate.tokenizer,

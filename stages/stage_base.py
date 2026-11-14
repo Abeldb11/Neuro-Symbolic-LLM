@@ -41,7 +41,7 @@ from metrics.performance import (
     ece_from_stats,
     heldout_transfer,
     mean_forgetting,
-    mean_seen_accuracy,
+    mean_seen_loss,
     multilabel_hit_metrics,
     perplexity,
     token_accuracy,
@@ -421,22 +421,11 @@ def prepare_domain(
     validation = load_token_blocks(
         substrate, domain, domain.eval_split, training.seq_len
     )
-    task_examples, label_token_ids = load_task_examples(
-        substrate, domain, domain.eval_split, training.seq_len
-    )
-    skip_reason = None
-    if not task_examples:
-        skip_reason = (
-            f"label field '{domain.label_field}' not in dataset or no labeled examples"
-        )
     return Domain(
         name=domain.name,
         train_blocks=train,
         eval_set=make_eval_set(validation, training.batch_size, training.eval_batches),
         epochs=training.epochs if domain.epochs is None else domain.epochs,
-        task_examples=task_examples,
-        label_token_ids=label_token_ids,
-        task_skip_reason=skip_reason,
     )
 
 
@@ -730,13 +719,11 @@ def summarize(
             ]
             for t in range(num_tasks)
         ],
-        "mean_seen_loss": [
-            float(mean_seen_accuracy(loss, t)) for t in range(num_tasks)
-        ],
+        "mean_seen_loss": [float(mean_seen_loss(loss, t)) for t in range(num_tasks)],
         # Undefined at t=0 (no earlier task), stored as null.
         "mean_forgetting": [None]
         + [
-            float(mean_forgetting(loss, t, higher_is_better=False))
+            float(mean_forgetting(loss, t))
             for t in range(1, num_tasks)
         ],
         "task_accuracy": task_accuracy.tolist() if has_task_metrics else None,
@@ -923,16 +910,6 @@ def run_sequential(
             row[d.name] = evaluate(
                 substrate, adapter, params, d.eval_set, jit=training.jit
             )
-            task_metrics = evaluate_task(
-                substrate,
-                adapter,
-                params,
-                d.task_examples,
-                d.label_token_ids,
-            )
-            row[d.name].update(task_metrics)
-            if not task_metrics and d.task_skip_reason:
-                row[d.name]["task_skip_reason"] = d.task_skip_reason
             writer.log("eval", after_task=after_task, domain=d.name, **row[d.name])
         if after_task < 0:
             log.info(
